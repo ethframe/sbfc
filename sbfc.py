@@ -35,12 +35,48 @@ class State:
         sys.stdout.flush()
 
 
+TEMPLATE = r"""#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+
+int int_pow(int base, int exp) {{
+    int res = 1;
+    while (exp > 0) {{
+        if (exp & 1) {{
+            res *= base;
+        }}
+        exp /= 2;
+        base *= base;
+    }}
+    return res;
+}}
+
+int main() {{
+    uint8_t *mem = NULL;
+    uint8_t *p = NULL;
+
+    p = mem = calloc(1, 65536); // Hope it will be enough;
+    if (p == NULL) {{
+        return -1;
+    }}
+
+{}
+
+    free(mem);
+    return 0;
+}}
+"""
+
+
 class Program:
     def __init__(self, insns):
         self.insns = insns
 
-    def __str__(self):
-        return '({})'.format(', '.join(map(str, self.insns)))
+    def source(self):
+        lines = [
+            '    ' + str(line) for insn in self.insns for line in insn.lines()
+        ]
+        return TEMPLATE.format('\n'.join(lines))
 
     def __len__(self):
         return sum(map(len, self.insns))
@@ -55,11 +91,11 @@ class Loop:
         self.offset = offset
         self.insns = insns
 
-    def __str__(self):
-        return '(while p[{}] do {})'.format(
-            self.offset,
-            ', '.join(map(str, self.insns))
-        )
+    def lines(self):
+        yield 'while (p[{}] != 0) {{'.format(self.offset)
+        for insn in self.insns:
+            yield from ('    ' + line for line in insn.lines())
+        yield '}'
 
     def __len__(self):
         return 1 + sum(map(len, self.insns))
@@ -82,8 +118,8 @@ class Move(Insn):
     def __init__(self, value):
         self.value = value
 
-    def __str__(self):
-        return 'p += {}'.format(self.value)
+    def lines(self):
+        yield 'p += {};'.format(self.value)
 
     def add_offset(self, offset):
         pass
@@ -96,8 +132,8 @@ class Input(Insn):
     def __init__(self, offset):
         self.offset = offset
 
-    def __str__(self):
-        return 'p[{}] = read()'.format(self.offset)
+    def lines(self):
+        yield 'p[{}] = getchar();'.format(self.offset)
 
     def add_offset(self, offset):
         self.offset += offset
@@ -110,8 +146,8 @@ class Output(Insn):
     def __init__(self, offset):
         self.offset = offset
 
-    def __str__(self):
-        return 'write(p[{}])'.format(self.offset)
+    def lines(self):
+        yield 'putchar(p[{}]);'.format(self.offset)
 
     def add_offset(self, offset):
         self.offset += offset
@@ -125,8 +161,8 @@ class Set(Insn):
         self.offset = offset
         self.expr = expr
 
-    def __str__(self):
-        return 'p[{}] = {}'.format(self.offset, self.expr)
+    def lines(self):
+        yield 'p[{}] = {};'.format(self.offset, self.expr)
 
     def add_offset(self, offset):
         self.offset += offset
@@ -170,8 +206,8 @@ class Poly:
         items = []
         for var, num in sorted(self.coeff.items()):
             fvar = ' * '.join(
-                'p[{}]^{}'.format(v, p) if p != 1 else 'p[{}]'.format(v)
-                for v, p in var
+                'int_pow(p[{}], {})'.format(v, p) if p != 1 else
+                'p[{}]'.format(v) for v, p in var
             )
             if fvar:
                 if num == 1:
@@ -345,7 +381,7 @@ def _dfs_order(graph, start, insns, users):
                 stack.append((child, iter(graph[child])))
                 break
         else:
-            if node != start:
+            if node != start and users[node]:
                 insn = insns[node]
                 if prev_write in insn.simple() and prev_users == {node}:
                     insn = insn.inline(prev_write, prev_expr)
@@ -488,7 +524,7 @@ PASSES = {
 }
 
 
-def eval_source(args):
+def compile_source(args):
     with open(args.path, 'r') as fp:
         program = parse(fp.read())
 
@@ -498,7 +534,7 @@ def eval_source(args):
         if args.verbose:
             print("{}: {} -> {}".format(opt.__name__, before, len(program)))
 
-    program.eval(State())
+    return program
 
 
 def main():
@@ -509,8 +545,18 @@ def main():
         choices=list(PASSES),
     )
     parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('-e', '--eval', action='store_true')
+    parser.add_argument('-o', '--output')
     args = parser.parse_args()
-    eval_source(args)
+    program = compile_source(args)
+    if args.eval:
+        program.eval(State())
+    else:
+        if args.output:
+            with open(args.output, 'w') as fp:
+                fp.write(program.source())
+        else:
+            print(program.source())
 
 
 if __name__ == '__main__':
