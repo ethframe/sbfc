@@ -312,6 +312,19 @@ class Poly:
                     offsets[v] = False
         return {o for o, s in offsets.items() if s}
 
+    def term(self):
+        if len(self.coeff) != 1:
+            return False
+        for var, num in self.coeff.items():
+            if len(var) == 0:
+                return True
+            if len(var) > 1 or num != 1:
+                return False
+            v, p = var[0]
+            if p != 1:
+                return False
+        return True
+
 
 def const(value):
     if value == 0:
@@ -383,9 +396,12 @@ def _dfs_order(graph, start, insns, users):
         else:
             if node != start and users[node]:
                 insn = insns[node]
-                if prev_write in insn.simple() and prev_users == {node}:
-                    insn = insn.inline(prev_write, prev_expr)
-                    out.pop()
+                if prev_write in insn.simple():
+                    if prev_users == {node}:
+                        insn = insn.inline(prev_write, prev_expr)
+                        out.pop()
+                    elif prev_expr.term():
+                        insn = insn.inline(prev_write, prev_expr)
                 out.append(insn)
                 prev_write = insn.writes()
                 prev_users = users[node]
