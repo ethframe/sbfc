@@ -378,6 +378,26 @@ def delay_moves(insns, start=0):
     return out
 
 
+def make_sets_pass(name, sets_fn):
+    def _pass(insns):
+        out = []
+        run = []
+        for insn in insns:
+            if isinstance(insn, Set):
+                run.append(insn)
+            else:
+                out.extend(sets_fn(run))
+                run = []
+                if isinstance(insn, Loop):
+                    insn.insns = _pass(insn.insns)
+                out.append(insn)
+        out.extend(sets_fn(run))
+        return out
+
+    _pass.__name__ = name
+    return _pass
+
+
 def _dfs_order(graph, start, insns, users):
     stack = [(start, iter(graph[start]))]
     visited = set([start])
@@ -454,48 +474,79 @@ def _inline_sets(insns):
     return _dfs_order(graph, tail, insns, users)
 
 
-def inline_expressions(insns):
+inline_expressions = make_sets_pass('inline_expressions', _inline_sets)
+
+
+def _use_recent_alias(insns):
+    alias = {}
     out = []
-    run = []
     for insn in insns:
-        if isinstance(insn, Set):
-            run.append(insn)
-        else:
-            out.extend(_inline_sets(run))
-            if isinstance(insn, Loop):
-                insn.insns = inline_expressions(insn.insns)
-            out.append(insn)
-            run = []
-    out.extend(_inline_sets(run))
+        for offset in insn.reads():
+            if offset in alias:
+                insn = insn.inline(offset, load(alias[offset]))
+        out.append(insn)
+
+        alias.pop(insn.offset, None)
+        for k, v in list(alias.items()):
+            if v == insn.offset:
+                del alias[k]
+
+        if insn.expr.term():
+            for offset in insn.reads():
+                alias[offset] = insn.offset
+
     return out
 
 
-def _is_zero(loop):
-    if len(loop.insns) != 1:
-        return False
-    insn = loop.insns[0]
-    if not isinstance(insn, Set):
-        return False
-    return insn.offset == loop.offset and \
-        insn.expr == load(loop.offset) + const(-1)
+use_recent_alias = make_sets_pass('use_recent_alias', _use_recent_alias)
 
 
-def _is_muladd(loop):
-    has_decrement = False
+def _move_muladd(loop):
     mutated = set()
+    outputted = set()
+    can_be_moved = {}
+    has_decrement = False
     for insn in loop.insns:
-        if not isinstance(insn, Set) or insn.offset in mutated:
-            return False
-        mutated.add(insn.offset)
+        if isinstance(insn, Set):
+            offset = insn.offset
+            if offset == loop.offset:
+                if has_decrement or insn.expr != load(offset) - const(1):
+                    return [loop]
+                has_decrement = True
+            elif offset in mutated:
+                can_be_moved.pop(offset, None)
+            else:
+                expr = insn.expr
+                if offset in expr.updates():
+                    can_be_moved[offset] = expr
+                mutated.add(offset)
+        elif isinstance(insn, Output):
+            outputted.add(insn.offset)
+        else:
+            return [loop]
+    if not has_decrement:
+        return [loop]
+    for offset in outputted:
+        can_be_moved.pop(offset, None)
+    for offset, expr in list(can_be_moved.items()):
+        if (expr.reads() & mutated) - {offset}:
+            del can_be_moved[offset]
+    out = []
+    body = []
     for insn in loop.insns:
-        splitted = insn.expr - load(insn.offset)
-        if splitted.reads() & mutated:
-            return False
-        if insn.offset == loop.offset:
-            if has_decrement or splitted != const(-1):
-                return False
-            has_decrement = True
-    return has_decrement
+        if isinstance(insn, Set) and insn.offset in can_be_moved:
+            expr = (
+                load(insn.offset) +
+                load(loop.offset) * (insn.expr - load(insn.offset))
+            )
+            out.append(Set(insn.offset, expr))
+        else:
+            body.append(insn)
+    if len(body) == 1:
+        out.append(Set(loop.offset, const(0)))
+    else:
+        out.append(Loop(loop.offset, body))
+    return out
 
 
 def replace_simple_loops(insns):
@@ -503,18 +554,9 @@ def replace_simple_loops(insns):
     for insn in insns:
         if isinstance(insn, Loop):
             insn.insns = replace_simple_loops(insn.insns)
-            if _is_zero(insn):
-                insn = Set(insn.offset, const(0))
-            elif _is_muladd(insn):
-                for i in insn.insns:
-                    if i.offset != insn.offset:
-                        expr = (
-                            load(insn.offset) * (i.expr - load(i.offset)) +
-                            load(i.offset)
-                        )
-                        out.append(Set(i.offset, expr))
-                insn = Set(insn.offset, const(0))
-        out.append(insn)
+            out.extend(_move_muladd(insn))
+        else:
+            out.append(insn)
     return out
 
 
@@ -522,19 +564,28 @@ PASSES = {
     0: [],
     1: [
         delay_moves,
+        use_recent_alias,
         inline_expressions,
     ],
     2: [
         delay_moves,
+        use_recent_alias,
         inline_expressions,
         replace_simple_loops,
+        use_recent_alias,
         inline_expressions,
     ],
     3: [
         delay_moves,
+        use_recent_alias,
         inline_expressions,
         replace_simple_loops,
+        use_recent_alias,
         inline_expressions,
+        use_recent_alias,
+        inline_expressions,
+        replace_simple_loops,
+        use_recent_alias,
         inline_expressions,
     ],
 }
